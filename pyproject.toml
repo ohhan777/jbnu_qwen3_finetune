@@ -1,0 +1,15 @@
+[project]
+name = "jbnu-qwen3-finetune"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.8.1",
+    "bitsandbytes>=0.46.1",
+    "datasets>=3.6.0",
+    "peft>=0.16.0",
+    "torch>=2.7.1",
+    "transformers>=4.53.1",
+    "trl>=0.19.0",
+]
