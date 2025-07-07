@@ -1,12 +1,10 @@
 import os
 import transformers
 from dataclasses import dataclass, field
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, DataCollatorForLanguageModeling
+from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling, Trainer
 import torch
 from typing import Optional
-from trl import SFTTrainer, SFTConfig
 from transformers import TrainingArguments
-from peft import LoraConfig, get_peft_model
 from datasets import load_dataset
 import pathlib
 
@@ -27,16 +25,17 @@ class DataArguments:
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
-    output_dir: Optional[str] = field(default="output")
+    output_dir: Optional[str] = field(default="output/Qwen3-8B-Medical-SFT")
     per_device_train_batch_size: int = field(default=1)
     per_device_eval_batch_size: int = field(default=1)
     gradient_accumulation_steps: int = field(default=2)
     optim: str = field(default="paged_adamw_32bit")
     num_train_epochs: int = field(default=1)
-    logging_steps: float = field(default=0.2)
+    logging_steps: float = field(default=0.05)
     warmup_steps: int = field(default=10)
     logging_strategy: str = field(default="steps")
     learning_rate: float = field(default=2e-4)
+    label_names: list[str] = field(default_factory=lambda: ["labels"])
     quant_type: str = field(default="nf4", metadata={"help": "Quantization data type to use. Should be one of `fp4` or `nf4`."})
     bits: int = field(default=4, metadata={"help": "How many bits to use."})
     lora_enable: bool = True
@@ -80,7 +79,14 @@ def make_supervised_data_module(tokenizer, data_args):
                 response += tokenizer.eos_token
             text = train_prompt_style.format(question, cot, response)
             texts.append(text)
-        return {"text": texts}
+        
+        # Tokenize the texts
+        tokenized = tokenizer(texts, truncation=True, padding=True, return_tensors="pt")
+        
+        # Create labels (same as input_ids for causal language modeling)
+        tokenized["labels"] = tokenized["input_ids"].clone()
+        
+        return tokenized
     
     train_dataset = load_dataset(
         data_args.name,
@@ -93,8 +99,10 @@ def make_supervised_data_module(tokenizer, data_args):
         batched=True,
     )
     data_collator = DataCollatorForLanguageModeling(
-    tokenizer=tokenizer,
-    mlm=False)
+        tokenizer=tokenizer,
+        mlm=False,
+        return_tensors="pt",
+    )
 
     return train_dataset, data_collator
 
@@ -120,7 +128,42 @@ def safe_save_model_for_hf_trainer(trainer, output_dir):
         cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
         del state_dict
         os.makedirs(output_dir, exist_ok=True)
-        torch.save(cpu_state_dict, os.path.join(output_dir, "finetuned_model.pt"))
+        trainer.model.save_pretrained(output_dir, state_dict=cpu_state_dict, safe_serialization=True)
+        # torch.save(cpu_state_dict, os.path.join(output_dir, "finetuned_model.pt"))
+
+
+def get_peft_state_dict(model, bias):
+    """Get LoRA state dict without zero_3 dependency"""
+    if bias == "none":
+        to_return = {k: t for k, t in model.named_parameters() if "lora_" in k}
+    elif bias == "all":
+        to_return = {k: t for k, t in model.named_parameters() if "lora_" in k or "bias" in k}
+    elif bias == "lora_only":
+        to_return = {}
+        maybe_lora_bias = {}
+        lora_bias_names = set()
+        for k, t in model.named_parameters():
+            if "lora_" in k:
+                to_return[k] = t
+                bias_name = k.split("lora_")[0] + "bias"
+                lora_bias_names.add(bias_name)
+            elif "bias" in k:
+                maybe_lora_bias[k] = t
+        for k, t in maybe_lora_bias.items():
+            if k in lora_bias_names:
+                to_return[k] = t
+    else:
+        raise NotImplementedError
+    return to_return
+
+
+def get_peft_state_non_lora_dict(named_params, require_grad_only=True):
+    """Get non-LoRA state dict without zero_3 dependency"""
+    to_return = {k: t for k, t in named_params if "lora_" not in k}
+    if require_grad_only:
+        to_return = {k: t for k, t in to_return.items() if t.requires_grad}
+    to_return = {k: v.cpu() for k, v in to_return.items()}
+    return to_return
         
 
 
@@ -147,6 +190,7 @@ def train():
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, use_fast=True)
 
     # LoRA
+    lora_config = None
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
         lora_config = LoraConfig(
@@ -166,35 +210,14 @@ def train():
             ],  # Target modules for LoRA
         )
         model = get_peft_model(model, lora_config)
-    else:
-        lora_config = None
 
-    training_dataset, data_collator = make_supervised_data_module(tokenizer, data_args)
+        training_dataset, data_collator = make_supervised_data_module(tokenizer, data_args)   
     
-    # Initialize the Trainer
-    sft_config = SFTConfig(
-        output_dir=training_args.output_dir,
-        per_device_train_batch_size=training_args.per_device_train_batch_size,
-        per_device_eval_batch_size=training_args.per_device_eval_batch_size,
-        gradient_accumulation_steps=training_args.gradient_accumulation_steps,
-        optim=training_args.optim,
-        num_train_epochs=training_args.num_train_epochs,
-        logging_steps=training_args.logging_steps,
-        warmup_steps=training_args.warmup_steps,
-        logging_strategy=training_args.logging_strategy,
-        learning_rate=training_args.learning_rate,
-        fp16=training_args.fp16,
-        bf16=training_args.bf16,
-        group_by_length=training_args.group_by_length,
-        report_to=training_args.report_to)
-    
-    trainer = SFTTrainer(
+    trainer = Trainer(
         model=model,
-        args=sft_config,
+        args=training_args,
         train_dataset=training_dataset,
-        peft_config=lora_config,
         data_collator=data_collator,
-        tokenizer=tokenizer,
         )
     
 
@@ -203,9 +226,21 @@ def train():
     else:
         trainer.train()
     trainer.save_state()
-    
-    safe_save_model_for_hf_trainer(trainer=trainer,
-                                       output_dir=training_args.output_dir)  
+
+    if training_args.lora_enable:
+        # Get LoRA state dict without zero_3
+        state_dict = get_peft_state_dict(model, training_args.lora_bias)
+        non_lora_state_dict = get_peft_state_non_lora_dict(model.named_parameters())
+        if training_args.local_rank == 0 or training_args.local_rank == -1:
+            if hasattr(model, "config"):
+                model.config.save_pretrained(training_args.output_dir)
+            if hasattr(model, "generation_config"):
+                model.generation_config.save_pretrained(training_args.output_dir)
+            model.save_pretrained(training_args.output_dir, state_dict=state_dict)
+            torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, "non_lora_trainables.bin"))
+    else:
+        safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+
 
 
 if __name__ == "__main__":
