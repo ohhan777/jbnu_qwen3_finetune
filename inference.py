@@ -115,10 +115,10 @@ def generate_response(question):
 if __name__ == "__main__":
     # Load dataset for testing
     from datasets import load_dataset
-    dataset = load_dataset("FreedomIntelligence/Medical-R1-Distill-Data", "en", split="train[2000:]")
+    dataset = load_dataset("FreedomIntelligence/medical-o1-reasoning-SFT", "en", split="train[2000:]")
     
     # Test with a sample question
-    question = dataset[0]['question']
+    question = dataset[0]['Question']
     print("=" * 80)
     print("[Question]")
     print(question)
