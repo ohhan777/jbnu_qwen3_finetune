@@ -18,14 +18,14 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    name: str = field(default="FreedomIntelligence/Medical-R1-Distill-Data", metadata={"help": "Path to the training data, in llava's instruction.json format. Supporting multiple json files via /path/to/{a,b,c}.json"})
+    name: str = field(default="FreedomIntelligence/medical-o1-reasoning-SFT", metadata={"help": "Path to the training data, in llava's instruction.json format. Supporting multiple json files via /path/to/{a,b,c}.json"})
     language: str = field(default="en", metadata={"help": "Language of the dataset."})
     split: str = field(default="train[0:2000]", metadata={"help": "Split of the dataset to use."})
     trust_remote_code: bool = field(default=True, metadata={"help": "Whether to trust remote code."})
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
-    output_dir: Optional[str] = field(default="output/Qwen3-8B-Medical-R1-Distill-Data")
+    output_dir: Optional[str] = field(default="output/Qwen3-8B-Medical-SFT2")
     per_device_train_batch_size: int = field(default=1)
     per_device_eval_batch_size: int = field(default=1)
     gradient_accumulation_steps: int = field(default=2)
@@ -69,9 +69,9 @@ def make_supervised_data_module(tokenizer, data_args):
         {}"""
     
     def formatting_prompts_func(examples):
-        inputs = examples["question"]
-        complex_cots = examples["reasoning (reasoning_content)"]
-        outputs = examples["response (content)"]
+        inputs = examples["Question"]
+        complex_cots = examples["Complex_CoT"]
+        outputs = examples["Response"]
         texts = []
         for question, cot, response in zip(inputs, complex_cots, outputs):
             # Append the EOS token to the response if it's not already there
@@ -107,7 +107,10 @@ def make_supervised_data_module(tokenizer, data_args):
     return train_dataset, data_collator
 
 
+
+
 def get_model(model_args, bnb_config):
+    
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         quantization_config=bnb_config,   
@@ -115,6 +118,7 @@ def get_model(model_args, bnb_config):
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     )
+
     return model
 
 
@@ -125,6 +129,7 @@ def safe_save_model_for_hf_trainer(trainer, output_dir):
         del state_dict
         os.makedirs(output_dir, exist_ok=True)
         trainer.model.save_pretrained(output_dir, state_dict=cpu_state_dict, safe_serialization=True)
+        # torch.save(cpu_state_dict, os.path.join(output_dir, "finetuned_model.pt"))
 
 
 def get_peft_state_dict(model, bias):
@@ -159,40 +164,33 @@ def get_peft_state_non_lora_dict(named_params, require_grad_only=True):
         to_return = {k: t for k, t in to_return.items() if t.requires_grad}
     to_return = {k: v.cpu() for k, v in to_return.items()}
     return to_return
+        
+
 
 
 def train():
+
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    
-    # Setup quantization config
     bnb_config = None
     if training_args.bits in [4, 8]:
         from transformers import BitsAndBytesConfig
         bnb_config = BitsAndBytesConfig(
-            load_in_4bit=training_args.bits == 4,
-            load_in_8bit=training_args.bits == 8,
+            load_in_4bit=True,
             bnb_4bit_use_double_quant=False,
-            bnb_4bit_quant_type=training_args.quant_type,
+            bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
 
-    # Load model
     model = get_model(model_args, bnb_config)
     model.config.use_cache = False
     model.config.pretraining_tp = 1
 
-    # Load tokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, use_fast=True)
-    
-    # Set padding token if not present
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
 
-    # Load dataset (moved outside of LoRA condition)
-    training_dataset, data_collator = make_supervised_data_module(tokenizer, data_args)
-
-    # Apply LoRA if enabled
+    # LoRA
+    lora_config = None
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
         lora_config = LoraConfig(
@@ -209,26 +207,26 @@ def train():
                 "gate_proj",
                 "up_proj",
                 "down_proj",
-            ],
+            ],  # Target modules for LoRA
         )
         model = get_peft_model(model, lora_config)
+
+        training_dataset, data_collator = make_supervised_data_module(tokenizer, data_args)   
     
-    # Setup trainer
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=training_dataset,
         data_collator=data_collator,
-    )
+        )
     
-    # Train
+
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
     trainer.save_state()
 
-    # Save model
     if training_args.lora_enable:
         # Get LoRA state dict without zero_3
         state_dict = get_peft_state_dict(model, training_args.lora_bias)
@@ -242,6 +240,7 @@ def train():
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, "non_lora_trainables.bin"))
     else:
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+
 
 
 if __name__ == "__main__":
